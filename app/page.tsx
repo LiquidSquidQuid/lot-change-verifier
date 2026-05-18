@@ -1,182 +1,316 @@
 "use client";
 
-import { useState, useMemo, useRef } from "react";
+import { useState, useMemo, useEffect, useRef, useCallback } from "react";
 import { QUANTITATIVE_ANALYTES, evaluate, type Analyte } from "./tea-data";
+import { Masthead } from "./_components/Masthead";
+import { Strip } from "./_components/Strip";
+import { Picker } from "./_components/Picker";
+import { AnalyteCard } from "./_components/AnalyteCard";
+import { SectionHeader } from "./_components/SectionHeader";
+import { DataTable } from "./_components/DataTable";
+import { TableActions } from "./_components/TableActions";
+import { VerdictBanner } from "./_components/VerdictBanner";
+import { EmptyState } from "./_components/EmptyState";
+import { Colophon } from "./_components/Colophon";
+import { TweaksPanel } from "./_components/TweaksPanel";
+import { demoValuesFor } from "./_components/utils";
+import type { Row, Result } from "./_components/types";
 
-function formatPct(v: number): string { return (v * 100).toFixed(1) + "%"; }
-
-interface Row { old: string; new: string; }
-interface Result { idx: number; old: number; new: number; pctDiff: number; absDiff: number; pass: boolean; }
+const ROW_COUNT = 10;
+const EMPTY_ROWS = () =>
+  Array(ROW_COUNT)
+    .fill(null)
+    .map(() => ({ old: "", new: "" }));
 
 export default function Page() {
   const [search, setSearch] = useState("");
   const [selected, setSelected] = useState<Analyte | null>(null);
-  const [showDropdown, setShowDropdown] = useState(false);
-  const [rows, setRows] = useState<Row[]>(Array(10).fill(null).map(() => ({ old: "", new: "" })));
+  const [open, setOpen] = useState(false);
+  const [activeIdx, setActiveIdx] = useState(0);
+  const [rows, setRows] = useState<Row[]>(EMPTY_ROWS);
 
+  // Tweaks
+  const [theme, setTheme] = useState("paper");
+  const [density, setDensity] = useState("comfortable");
+  const [showSig, setShowSig] = useState(true);
+
+  const inputRef = useRef<HTMLInputElement>(null);
+  const dropdownRef = useRef<HTMLDivElement>(null);
+
+  // Load persisted tweaks
+  useEffect(() => {
+    try {
+      const stored = localStorage.getItem("lcv-tweaks");
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        if (parsed.theme) setTheme(parsed.theme);
+        if (parsed.density) setDensity(parsed.density);
+        if (parsed.showSig !== undefined) setShowSig(parsed.showSig);
+      }
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  // Persist tweaks
+  useEffect(() => {
+    localStorage.setItem(
+      "lcv-tweaks",
+      JSON.stringify({ theme, density, showSig })
+    );
+  }, [theme, density, showSig]);
+
+  // Apply theme/density to body
+  useEffect(() => {
+    document.body.classList.remove(
+      "theme-paper",
+      "theme-graphite",
+      "theme-ink"
+    );
+    document.body.classList.add(`theme-${theme}`);
+    document.body.classList.remove(
+      "density-compact",
+      "density-comfortable",
+      "density-roomy"
+    );
+    document.body.classList.add(`density-${density}`);
+  }, [theme, density]);
+
+  // Derived: filtered analytes
   const filtered = useMemo(() => {
     if (!search) return QUANTITATIVE_ANALYTES;
     const s = search.toLowerCase();
-    return QUANTITATIVE_ANALYTES.filter(a =>
-      a.name.toLowerCase().includes(s) || a.instrument.toLowerCase().includes(s)
+    return QUANTITATIVE_ANALYTES.filter(
+      (a) =>
+        a.name.toLowerCase().includes(s) ||
+        a.instrument.toLowerCase().includes(s) ||
+        a.specimen.toLowerCase().includes(s)
     );
   }, [search]);
 
-  const results: Result[] = useMemo(() => {
+  // Derived: grouped by instrument
+  const grouped = useMemo(() => {
+    const map = new Map<string, Analyte[]>();
+    filtered.forEach((a) => {
+      const k = a.instrument;
+      if (!map.has(k)) map.set(k, []);
+      map.get(k)!.push(a);
+    });
+    return Array.from(map.entries());
+  }, [filtered]);
+
+  // Derived: flat list for keyboard nav
+  const flat = useMemo(
+    () => grouped.flatMap(([, items]) => items),
+    [grouped]
+  );
+
+  // Derived: results (preserves null for positional indexing)
+  const results = useMemo((): (Result | null)[] => {
     if (!selected) return [];
     return rows.map((r, i) => {
       const o = parseFloat(r.old);
       const n = parseFloat(r.new);
       if (isNaN(o) || isNaN(n)) return null;
-      const pctDiff = o !== 0 ? Math.abs((n - o) / o) : 0;
+      const pctDiff =
+        o !== 0 ? Math.abs((n - o) / o) : n === 0 ? 0 : 1;
       const absDiff = Math.abs(n - o);
       const pass = evaluate(o, n, selected);
       return { idx: i, old: o, new: n, pctDiff, absDiff, pass };
-    }).filter((r): r is Result => r !== null);
+    });
   }, [rows, selected]);
 
+  // Derived: summary with worst drift
   const summary = useMemo(() => {
-    if (results.length === 0) return null;
-    const passing = results.filter(r => r.pass).length;
-    const failing = results.length - passing;
-    const pctFail = failing / results.length;
-    const overall = failing === 0 ? "PASS" : pctFail > 0.2 ? "FAIL" : "REVIEW";
-    return { total: results.length, passing, failing, pctFail, overall };
+    const valid = results.filter((r): r is Result => r !== null);
+    if (valid.length === 0) return null;
+    const passing = valid.filter((r) => r.pass).length;
+    const failing = valid.length - passing;
+    const pctFail = failing / valid.length;
+    const overall: "PASS" | "FAIL" | "REVIEW" =
+      failing === 0 ? "PASS" : pctFail > 0.2 ? "FAIL" : "REVIEW";
+    let worst = 0;
+    valid.forEach((r) => {
+      if (r.pctDiff > worst) worst = r.pctDiff;
+    });
+    return { total: valid.length, passing, failing, pctFail, overall, worst };
   }, [results]);
 
-  const selectAnalyte = (a: Analyte) => {
+  // Actions
+  const selectAnalyte = useCallback((a: Analyte) => {
     setSelected(a);
     setSearch(a.name);
-    setShowDropdown(false);
-  };
+    setOpen(false);
+  }, []);
 
   const clearAll = () => {
     setSelected(null);
     setSearch("");
-    setRows(Array(10).fill(null).map(() => ({ old: "", new: "" })));
+    setRows(EMPTY_ROWS());
+    inputRef.current?.focus();
   };
 
   const updateRow = (i: number, field: "old" | "new", val: string) => {
-    setRows(prev => {
+    setRows((prev) => {
       const copy = [...prev];
       copy[i] = { ...copy[i], [field]: val };
       return copy;
     });
   };
 
+  const onDemo = () => {
+    if (selected) {
+      const demo = demoValuesFor(selected);
+      setRows(
+        demo
+          .slice(0, ROW_COUNT)
+          .map((r) => ({ old: String(r.old), new: String(r.new) }))
+      );
+    }
+  };
+
+  const onClearRows = () => setRows(EMPTY_ROWS());
+
+  // Keyboard nav for picker
+  const onKey = useCallback(
+    (e: React.KeyboardEvent) => {
+      if (!open) {
+        if (e.key === "ArrowDown" || e.key === "Enter") {
+          setOpen(true);
+          return;
+        }
+        return;
+      }
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setActiveIdx((i) => Math.min(flat.length - 1, i + 1));
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setActiveIdx((i) => Math.max(0, i - 1));
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        if (flat[activeIdx]) selectAnalyte(flat[activeIdx]);
+      } else if (e.key === "Escape") {
+        setOpen(false);
+      }
+    },
+    [open, flat, activeIdx, selectAnalyte]
+  );
+
+  // Reset activeIdx on search change
+  useEffect(() => {
+    setActiveIdx(0);
+  }, [search]);
+
+  // ⌘K to focus search
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        inputRef.current?.focus();
+        inputRef.current?.select();
+        setOpen(true);
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, []);
+
+  // Close dropdown on outside click
+  useEffect(() => {
+    const onClick = (e: MouseEvent) => {
+      if (
+        !dropdownRef.current?.contains(e.target as Node) &&
+        !inputRef.current?.contains(e.target as Node)
+      ) {
+        setOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onClick);
+    return () => document.removeEventListener("mousedown", onClick);
+  }, []);
+
   return (
-    <div className="min-h-screen bg-zinc-50">
-      <div className="max-w-[860px] mx-auto px-4 py-6 font-mono text-[13px] text-zinc-900">
+    <div className="page">
+      <Masthead />
+      <Strip onClear={clearAll} hasData={selected != null} />
 
-        <div className="flex items-baseline justify-between border-b-[3px] border-zinc-900 pb-2 mb-5">
-          <div>
-            <h1 className="text-lg font-bold tracking-wider uppercase m-0">Lot Change Verifier</h1>
-            <p className="text-[11px] text-zinc-500 tracking-wide m-0">SAMC Clinical Chemistry — TEa v3.2 · CLIA 2024</p>
-          </div>
-          <button onClick={clearAll} className="bg-zinc-900 text-white border-none px-4 py-1.5 text-[11px] tracking-wider uppercase cursor-pointer hover:bg-zinc-700 transition-colors">
-            Clear
-          </button>
-        </div>
+      <Picker
+        ref={inputRef}
+        dropdownRef={dropdownRef}
+        search={search}
+        setSearch={(v) => {
+          setSearch(v);
+          setSelected(null);
+          setOpen(true);
+        }}
+        selected={selected}
+        open={open}
+        setOpen={setOpen}
+        onKey={onKey}
+        grouped={grouped}
+        flat={flat}
+        activeIdx={activeIdx}
+        setActiveIdx={setActiveIdx}
+        selectAnalyte={selectAnalyte}
+        onClearSelection={() => {
+          setSelected(null);
+          setSearch("");
+          setOpen(true);
+          inputRef.current?.focus();
+        }}
+      />
 
-        <div className="relative mb-4">
-          <input
-            value={search}
-            onChange={e => { setSearch(e.target.value); setShowDropdown(true); setSelected(null); }}
-            onFocus={() => setShowDropdown(true)}
-            onBlur={() => setTimeout(() => setShowDropdown(false), 200)}
-            placeholder="Type analyte name..."
-            className={`w-full px-3 py-2.5 text-sm border-2 border-zinc-900 outline-none font-mono ${selected ? "bg-green-50" : "bg-amber-50"}`}
+      {selected ? (
+        <>
+          <AnalyteCard analyte={selected} />
+
+          <SectionHeader
+            num="03"
+            title="Paired Values"
+            helper={
+              <>
+                Enter <kbd>old</kbd> and <kbd>new</kbd> lot results. Press{" "}
+                <kbd>Tab</kbd> to advance.
+              </>
+            }
           />
-          {showDropdown && !selected && filtered.length > 0 && (
-            <div className="absolute top-full left-0 right-0 max-h-60 overflow-y-auto bg-white border-2 border-zinc-900 border-t-0 z-10 shadow-lg">
-              {filtered.slice(0, 30).map(a => (
-                <div key={a.name} onMouseDown={() => selectAnalyte(a)}
-                  className="flex justify-between px-3 py-2 cursor-pointer border-b border-zinc-100 hover:bg-blue-50 transition-colors">
-                  <span className="font-semibold">{a.name}</span>
-                  <span className="text-zinc-400 text-[11px]">{a.instrument}</span>
-                </div>
-              ))}
-            </div>
+
+          <DataTable
+            rows={rows}
+            results={results}
+            analyte={selected}
+            updateRow={updateRow}
+          />
+
+          <TableActions
+            onDemo={onDemo}
+            onClear={onClearRows}
+            count={results.filter(Boolean).length}
+          />
+
+          {summary && (
+            <VerdictBanner
+              key={`${summary.overall}-${summary.total}`}
+              summary={summary}
+              showSig={showSig}
+            />
           )}
-        </div>
+        </>
+      ) : (
+        <EmptyState />
+      )}
 
-        {selected && (
-          <div className="grid grid-cols-4 gap-px bg-zinc-900 mb-5 text-[13px]">
-            {([
-              ["TEa %", selected.teaPct ? formatPct(selected.teaPct) : "—"],
-              ["TEa Fixed", selected.teaFixed ? `±${selected.teaFixed} ${selected.fixedUnits}` : "—"],
-              ["Criterion", selected.criterion],
-              ["Instrument", selected.instrument],
-            ] as const).map(([label, val]) => (
-              <div key={label} className="bg-zinc-50 px-3 py-2">
-                <div className="text-[10px] text-zinc-400 uppercase tracking-wider">{label}</div>
-                <div className="font-semibold mt-0.5">{val}</div>
-              </div>
-            ))}
-          </div>
-        )}
+      <Colophon />
 
-        {selected && (
-          <>
-            <div className="grid gap-px bg-zinc-900" style={{ gridTemplateColumns: "32px 1fr 1fr 80px 80px 72px" }}>
-              {["#", `Old (${selected.units})`, `New (${selected.units})`, "% Diff", "Abs Diff", "Result"].map(h => (
-                <div key={h} className="bg-zinc-900 text-white px-2 py-1.5 text-[10px] uppercase tracking-wider font-bold">{h}</div>
-              ))}
-              {rows.map((r, i) => {
-                const res = results.find(x => x.idx === i);
-                return (
-                  <div key={i} className="contents">
-                    <div className="bg-zinc-100 px-2 py-1.5 flex items-center text-zinc-400">{i + 1}</div>
-                    <div className="bg-white">
-                      <input value={r.old} onChange={e => updateRow(i, "old", e.target.value)}
-                        className="w-full px-2 py-1.5 border-none text-[13px] font-mono bg-transparent outline-none focus:bg-amber-50 transition-colors"
-                        tabIndex={i * 2 + 1} inputMode="decimal" />
-                    </div>
-                    <div className="bg-white">
-                      <input value={r.new} onChange={e => updateRow(i, "new", e.target.value)}
-                        className="w-full px-2 py-1.5 border-none text-[13px] font-mono bg-transparent outline-none focus:bg-amber-50 transition-colors"
-                        tabIndex={i * 2 + 2} inputMode="decimal" />
-                    </div>
-                    <div className="bg-zinc-50 px-2 py-1.5 text-right tabular-nums">
-                      {res ? (res.pctDiff * 100).toFixed(1) + "%" : ""}
-                    </div>
-                    <div className="bg-zinc-50 px-2 py-1.5 text-right tabular-nums">
-                      {res ? res.absDiff.toFixed(2) : ""}
-                    </div>
-                    <div className={`px-2 py-1.5 text-center font-bold text-[12px] ${
-                      res ? (res.pass ? "bg-emerald-600 text-white" : "bg-red-600 text-white") : "bg-zinc-50"
-                    }`}>
-                      {res ? (res.pass ? "PASS" : "FAIL") : ""}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-
-            {summary && (
-              <div className={`mt-4 flex items-center gap-3 px-4 py-3 text-white ${
-                summary.overall === "PASS" ? "bg-emerald-600" :
-                summary.overall === "FAIL" ? "bg-red-600" : "bg-amber-600"
-              }`}>
-                <span className="text-xl font-extrabold tracking-widest">{summary.overall}</span>
-                <span className="text-[12px] opacity-90">
-                  {summary.passing}/{summary.total} pass · {summary.failing} exceed TEa · {(summary.pctFail * 100).toFixed(0)}% fail rate
-                </span>
-              </div>
-            )}
-          </>
-        )}
-
-        {!selected && (
-          <div className="text-center py-16 text-zinc-400 text-[12px]">
-            Select an analyte to begin verification
-          </div>
-        )}
-
-        <div className="mt-8 pt-3 border-t border-zinc-200 text-[10px] text-zinc-400 text-center">
-          SAMC Lab Operations · TEa Reference Database v3.2 · CLIA 2024 (42 CFR §493) · For internal use only
-        </div>
-      </div>
+      <TweaksPanel
+        theme={theme}
+        density={density}
+        showSig={showSig}
+        onThemeChange={setTheme}
+        onDensityChange={setDensity}
+        onShowSigChange={setShowSig}
+      />
     </div>
   );
 }
